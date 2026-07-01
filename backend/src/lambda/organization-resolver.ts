@@ -3,6 +3,7 @@ import { DynamoDBDocumentClient, PutCommand, DeleteCommand, ScanCommand } from '
 import {
   CognitoIdentityProviderClient,
   ListUsersCommand,
+  ListUsersCommandOutput,
 } from '@aws-sdk/client-cognito-identity-provider';
 import { v4 as uuidv4 } from 'uuid';
 
@@ -125,9 +126,15 @@ async function deleteOrganization(orgId: string): Promise<UserManagementResponse
   //    an org while users still point to it leaves dangling JWT claims
   //    and risks cross-tenant access if the orgId is ever reused.
   //
-  //    Mirror the `createOrganization` "pre-check + throw" idiom used
-  //    above — list users with a server-side filter, hard-cap to 1, fail
-  //    closed if any are returned.
+  //    Cognito ListUsers CANNOT server-side filter on custom attributes —
+  //    `custom:*` attributes are not indexed, so a `Filter` on one returns
+  //    InvalidParameterException ("Input fails to satisfy the constraints").
+  //    AWS's guidance is to use a client-side filter instead, so we page
+  //    through the pool and match `custom:organization` in code, failing
+  //    closed if any user still points at this org. The pool is small
+  //    (internal platform), so a full scan is acceptable; revisit if the
+  //    user base grows materially.
+  //    Ref: https://docs.aws.amazon.com/cognito-user-identity-pools/latest/APIReference/API_ListUsers.html
   //
   //    Defensive guard: if USER_POOL_ID is unset (e.g. transitional
   //    deploy ordering or local fixture), refuse the delete rather than
@@ -139,18 +146,30 @@ async function deleteOrganization(orgId: string): Promise<UserManagementResponse
     );
   }
 
-  const usersResponse = await cognitoClient.send(
-    new ListUsersCommand({
-      UserPoolId: USER_POOL_ID,
-      // Cognito ListUsers filter syntax requires the attribute name to be
-      // wrapped in double quotes when it contains a colon (custom:*).
-      // Reference: https://docs.aws.amazon.com/cognito/latest/developerguide/how-to-manage-user-accounts.html#cognito-user-pools-searching-for-users-using-listusers-api
-      Filter: `"custom:organization" = "${orgId}"`,
-      Limit: 1,
-    })
-  );
+  let hasAssignedUser = false;
+  let paginationToken: string | undefined = undefined;
+  do {
+    // No `AttributesToGet` filter: Cognito errors if a requested attribute
+    // is unset on any returned user, so we fetch full profiles and read
+    // `custom:organization` locally. Limit 60 is the ListUsers maximum.
+    const usersResponse: ListUsersCommandOutput = await cognitoClient.send(
+      new ListUsersCommand({
+        UserPoolId: USER_POOL_ID,
+        Limit: 60,
+        PaginationToken: paginationToken,
+      })
+    );
 
-  if (usersResponse.Users && usersResponse.Users.length > 0) {
+    hasAssignedUser = (usersResponse.Users ?? []).some((user) =>
+      (user.Attributes ?? []).some(
+        (attr) => attr.Name === 'custom:organization' && attr.Value === orgId
+      )
+    );
+
+    paginationToken = usersResponse.PaginationToken;
+  } while (!hasAssignedUser && paginationToken);
+
+  if (hasAssignedUser) {
     throw new Error(
       'Cannot delete organization: 1+ user(s) still assigned. Reassign or remove these users before deleting the organization.'
     );

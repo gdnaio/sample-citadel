@@ -85,38 +85,52 @@ describe('organization-resolver', () => {
   });
 
   describe('deleteOrganization', () => {
-    test('deletes empty organization, calls ListUsersCommand with correct filter, then DeleteCommand', async () => {
+    test('deletes org when no assigned user matches (client-side filter), then DeleteCommand', async () => {
       // Existence check returns the org row.
       dynamoMock.on(ScanCommand).resolves({
         Items: [{ orgId: 'org-1', name: 'Org' }],
       });
-      // Cognito returns no users with matching custom:organization claim.
-      cognitoMock.on(ListUsersCommand).resolves({ Users: [] });
+      // Cognito returns a user, but one assigned to a DIFFERENT org — it must
+      // be ignored by the client-side custom:organization match.
+      cognitoMock.on(ListUsersCommand).resolves({
+        Users: [
+          {
+            Username: 'other-org-user',
+            Attributes: [{ Name: 'custom:organization', Value: 'org-OTHER' }],
+          },
+        ],
+      });
       dynamoMock.on(DeleteCommand).resolves({});
 
       const result = await handler(makeEvent('deleteOrganization', { orgId: 'org-1' }));
 
       expect(result.success).toBe(true);
 
-      // ListUsersCommand was invoked with the correct user-pool + filter.
+      // ListUsers hits the right pool WITHOUT a server-side Filter (Cognito
+      // rejects filters on custom attributes) and pages at the max Limit.
       const listUsersCalls = cognitoMock.commandCalls(ListUsersCommand);
       expect(listUsersCalls).toHaveLength(1);
-      const listInput = listUsersCalls[0].args[0].input as any;
+      const listInput = listUsersCalls[0].args[0].input;
       expect(listInput.UserPoolId).toBe('us-east-1_testpool');
-      expect(listInput.Filter).toBe('"custom:organization" = "org-1"');
-      expect(listInput.Limit).toBe(1);
+      expect(listInput.Filter).toBeUndefined();
+      expect(listInput.Limit).toBe(60);
 
       // DeleteCommand ran exactly once.
       expect(dynamoMock.commandCalls(DeleteCommand)).toHaveLength(1);
     });
 
-    test('throws when organization still has users assigned, DeleteCommand NOT called', async () => {
+    test('throws when a user is still assigned to the org, DeleteCommand NOT called', async () => {
       dynamoMock.on(ScanCommand).resolves({
         Items: [{ orgId: 'org-1', name: 'Org' }],
       });
-      // Cognito returns one user — org cannot be deleted while users link to it.
+      // A user still carries custom:organization === orgId — block deletion.
       cognitoMock.on(ListUsersCommand).resolves({
-        Users: [{ Username: 'still-here-user', Attributes: [] }],
+        Users: [
+          {
+            Username: 'still-here-user',
+            Attributes: [{ Name: 'custom:organization', Value: 'org-1' }],
+          },
+        ],
       });
 
       await expect(
@@ -124,6 +138,44 @@ describe('organization-resolver', () => {
       ).rejects.toThrow(/user\(s\) still assigned/);
 
       // DeleteCommand must NOT have run.
+      expect(dynamoMock.commandCalls(DeleteCommand)).toHaveLength(0);
+    });
+
+    test('pages through ListUsers and blocks delete when the match is on a later page', async () => {
+      dynamoMock.on(ScanCommand).resolves({
+        Items: [{ orgId: 'org-1', name: 'Org' }],
+      });
+      // Page 1: a non-matching user + a PaginationToken. Page 2: the matching
+      // user, no token. The resolver must follow the token to find the match.
+      cognitoMock
+        .on(ListUsersCommand)
+        .resolvesOnce({
+          Users: [
+            {
+              Username: 'other-org-user',
+              Attributes: [{ Name: 'custom:organization', Value: 'org-OTHER' }],
+            },
+          ],
+          PaginationToken: 'page-2',
+        })
+        .resolvesOnce({
+          Users: [
+            {
+              Username: 'still-here-user',
+              Attributes: [{ Name: 'custom:organization', Value: 'org-1' }],
+            },
+          ],
+        });
+
+      await expect(
+        handler(makeEvent('deleteOrganization', { orgId: 'org-1' }))
+      ).rejects.toThrow(/user\(s\) still assigned/);
+
+      // Both pages fetched; the second call carried the PaginationToken.
+      const listUsersCalls = cognitoMock.commandCalls(ListUsersCommand);
+      expect(listUsersCalls).toHaveLength(2);
+      expect(listUsersCalls[1].args[0].input.PaginationToken).toBe('page-2');
+
       expect(dynamoMock.commandCalls(DeleteCommand)).toHaveLength(0);
     });
 
@@ -136,7 +188,7 @@ describe('organization-resolver', () => {
       ).rejects.toThrow('not found');
 
       // Cognito must NOT be consulted — existence check short-circuits first.
-      // Pins the ordering invariant: existence-check → user-count check → delete.
+      // Pins the ordering invariant: existence-check → user-scan → delete.
       expect(cognitoMock.commandCalls(ListUsersCommand)).toHaveLength(0);
       expect(dynamoMock.commandCalls(DeleteCommand)).toHaveLength(0);
     });
