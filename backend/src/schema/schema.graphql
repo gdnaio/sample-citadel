@@ -30,6 +30,14 @@ type Query {
   getCurrentUserProfile: User
   listAvailableRoles: [String]
   listOrganizations: [Organization]
+  # --- Team & Operational-Unit management (Unit B — US-012/013/014/015) ---
+  # Default Cognito auth; the team-resolver enforces org-scoping (a caller may
+  # only read teams/op-units within their own orgId) as defence in depth.
+  listTeams(orgId: String!): [Team!]!
+  getTeam(teamId: ID!): Team
+  listOperationalUnits(orgId: String!): [OperationalUnit!]!
+  listTeamMembers(teamId: ID!): [TeamMembership!]!
+  listTeamsForOperationalUnit(ouId: ID!): [Team!]!
   getWorkflow(workflowId: ID!): Workflow
   listWorkflows(orgId: String!, status: WorkflowStatus): WorkflowConnection
   listBlueprints(category: String): BlueprintConnection
@@ -238,6 +246,20 @@ type Mutation {
   adminResendInvitation(userId: String!): UserManagementResponse
   createOrganization(input: CreateOrganizationInput!): Organization
   deleteOrganization(orgId: String!): UserManagementResponse
+  # --- Team & Operational-Unit management (Unit B — US-012/013/014) ---
+  # All admin-only: the team-resolver runs isAdminFromEvent + org-scoping and
+  # audits every attempt BEFORE the authorization decision (audit-before-auth,
+  # via the Foundation AuditWriter). elevateRole to `admin` is admin-only and
+  # audited, consistent with US-008 (no auto-admin). Default Cognito auth.
+  createTeam(orgId: String!, name: String!): Team!
+  renameTeam(teamId: ID!, name: String!): Team!
+  deleteTeam(teamId: ID!): TeamMutationResult!
+  createOperationalUnit(orgId: String!, name: String!, source: String!): OperationalUnit!
+  mapTeamToOperationalUnit(teamId: ID!, ouId: ID!): TeamOperationalUnitMapping!
+  unmapTeamFromOperationalUnit(teamId: ID!, ouId: ID!): TeamMutationResult!
+  addTeamMember(teamId: ID!, userSub: String!): TeamMembership!
+  removeTeamMember(teamId: ID!, userSub: String!): TeamMutationResult!
+  elevateRole(userSub: String!, group: String!): UserManagementResponse!
   publishAssessmentCompletion(input: AssessmentCompletionInput!): AssessmentCompletionEvent @aws_iam
   publishDesignProgress(input: DesignProgressInput!): DesignProgressEvent @aws_iam @aws_cognito_user_pools
   publishChatter(input: AgentChatterInput!): AgentChatterMessage @aws_iam
@@ -881,6 +903,56 @@ type Organization {
   name: String!
   description: String
   createdAt: AWSDateTime
+}
+
+# --- Team & Operational-Unit management (Unit B) ------------------------------
+# Single-table store `citadel-teams-{env}`; all entities are org-scoped. Shapes
+# mirror the Foundation shared types (backend/src/identity/types) consumed by
+# the TeamRepository. Operational units are admin-created in this slice and
+# fed by Unit C's external ingestion in a later slice (Customer/Supplier — C
+# supplies, B owns).
+
+# A Citadel-managed grouping of users, mapped to one or more operational units.
+type Team {
+  teamId: ID!
+  name: String!
+  orgId: String!
+  createdAt: AWSDateTime!
+  createdBy: String!
+}
+
+# A unit of the business configured in an external system (source), mapped to
+# Citadel teams. `active` gates auto-join; `lastSyncedAt` is set by Unit C sync.
+type OperationalUnit {
+  id: ID!
+  name: String!
+  source: String!
+  orgId: String!
+  active: Boolean!
+  lastSyncedAt: AWSDateTime
+}
+
+# A user's membership in a team. `joinedBy` is the actor sub, or `system` for
+# event-driven auto-join (US-006b).
+type TeamMembership {
+  teamId: ID!
+  userSub: String!
+  orgId: String!
+  joinedAt: AWSDateTime!
+  joinedBy: String!
+}
+
+# A many-to-many mapping between a team and an operational unit (US-013).
+type TeamOperationalUnitMapping {
+  teamId: ID!
+  operationalUnitId: ID!
+  orgId: String!
+}
+
+# Generic result for team/op-unit delete + unmap + remove-member mutations.
+type TeamMutationResult {
+  success: Boolean!
+  message: String
 }
 
 type AssessmentCompletionEvent {

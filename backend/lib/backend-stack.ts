@@ -20,14 +20,37 @@ import { Provider } from "aws-cdk-lib/custom-resources";
 import { CustomResource, Duration } from "aws-cdk-lib";
 import { NagSuppressions } from "cdk-nag";
 import { buildImportDiscoveryPolicy } from "../src/utils/agent-import-policy";
+import { IdentityFoundation } from "./constructs/identity-foundation";
+import { UsersTable } from "./constructs/users-table";
+import { TeamManagementStack } from "./constructs/team-management-stack";
+import { OidcIdentityProvider } from "./constructs/oidc-identity-provider";
+
+/**
+ * Optional SSO/OIDC configuration (cognito-sso-team-management). When present, the
+ * OIDC identity provider + Hosted UI, first-login provisioning (users table, audit,
+ * triggers) and the reconciler are wired in. When ABSENT the stack is unchanged —
+ * the feature is fully opt-in.
+ */
+export interface OidcConfig {
+  issuerUrl: string;
+  clientId: string;
+  /** Secrets Manager secret NAME holding the OIDC client secret (name-only). */
+  clientSecretName: string;
+  hostedUiDomainPrefix: string;
+  callbackUrls: string[];
+  logoutUrls: string[];
+}
 
 interface BackendStackProps extends cdk.StackProps {
   environment: string;
+  oidcConfig?: OidcConfig;
 }
 
 export class BackendStack extends cdk.Stack {
   public readonly appSyncApi: appsync.GraphqlApi;
   public readonly userPool: cognito.UserPool;
+  /** Unit B team-management resources (present only when oidcConfig is supplied). */
+  public teamManagement?: TeamManagementStack;
   public readonly userPoolClient: cognito.UserPoolClient;
   public readonly agentConfigTable: dynamodb.Table;
   public readonly agentEventBus: events.EventBus;
@@ -562,6 +585,19 @@ export class BackendStack extends cdk.Stack {
         description: "Development access",
     });
 
+    // SSO OIDC identity provider (opt-in). Created before the client so it can be
+    // listed in supportedIdentityProviders. No-op when oidcConfig is absent.
+    const oidcProvider = props.oidcConfig
+      ? new OidcIdentityProvider(this, "OidcIdentityProvider", {
+          userPool: this.userPool,
+          environment: props.environment,
+          clientId: props.oidcConfig.clientId,
+          clientSecretName: props.oidcConfig.clientSecretName,
+          issuerUrl: props.oidcConfig.issuerUrl,
+          hostedUiDomainPrefix: props.oidcConfig.hostedUiDomainPrefix,
+        })
+      : undefined;
+
     // User Pool Client
     this.userPoolClient = new cognito.UserPoolClient(this, "UserPoolClient", {
       userPool: this.userPool,
@@ -582,11 +618,129 @@ export class BackendStack extends cdk.Stack {
           cognito.OAuthScope.OPENID,
           cognito.OAuthScope.PROFILE,
         ],
+        ...(props.oidcConfig
+          ? { callbackUrls: props.oidcConfig.callbackUrls, logoutUrls: props.oidcConfig.logoutUrls }
+          : {}),
       },
+      ...(oidcProvider
+        ? {
+            supportedIdentityProviders: [
+              cognito.UserPoolClientIdentityProvider.COGNITO,
+              cognito.UserPoolClientIdentityProvider.custom(oidcProvider.providerName),
+            ],
+          }
+        : {}),
       refreshTokenValidity: cdk.Duration.days(30),
       accessTokenValidity: cdk.Duration.hours(1),
       idTokenValidity: cdk.Duration.hours(1),
     });
+
+    // ---- cognito-sso-team-management: first-login provisioning wiring (opt-in) ----
+    if (props.oidcConfig && oidcProvider) {
+      // Client references the OIDC provider by name; ensure it is created first.
+      this.userPoolClient.node.addDependency(oidcProvider.provider);
+
+      // Shared kernel (audit trail + safe trigger IAM) + provisioned-user table.
+      const identityFoundation = new IdentityFoundation(this, "IdentityFoundation", {
+        environment: props.environment,
+      });
+      const usersTable = new UsersTable(this, "UsersTable", { environment: props.environment });
+
+      // Enable + permission the pre-token trigger for first-login provisioning.
+      preTokenGenerationLambda.addEnvironment("USERS_TABLE", usersTable.table.tableName);
+      preTokenGenerationLambda.addEnvironment("AUDIT_TABLE", identityFoundation.auditTable.tableName);
+      preTokenGenerationLambda.addEnvironment("EVENT_BUS_NAME", this.agentEventBus.eventBusName);
+      usersTable.table.grantReadWriteData(preTokenGenerationLambda);
+      identityFoundation.auditTable.grantWriteData(preTokenGenerationLambda);
+      this.agentEventBus.grantPutEventsTo(preTokenGenerationLambda);
+      identityFoundation.grantTriggerGroupManagement(preTokenGenerationLambda);
+
+      // Pre-signup account-linking trigger.
+      const preSignUpLambda = new lambda.Function(this, "PreSignUpFunction", {
+        runtime: lambda.Runtime.NODEJS_24_X,
+        handler: "pre-signup.handler",
+        code: lambda.Code.fromAsset("dist/lambda"),
+        functionName: `citadel-pre-signup-${props.environment}`,
+        timeout: cdk.Duration.seconds(5),
+        logGroup: new logs.LogGroup(this, "PreSignUpFunctionLogs", {
+          retention: logs.RetentionDays.ONE_WEEK,
+          removalPolicy: cdk.RemovalPolicy.DESTROY,
+        }),
+      });
+      preSignUpLambda.addToRolePolicy(
+        new iam.PolicyStatement({
+          effect: iam.Effect.ALLOW,
+          actions: ["cognito-idp:ListUsers", "cognito-idp:AdminLinkProviderForUser"],
+          // Pseudo-parameter ARN avoids the UserPool<->trigger circular dependency.
+          resources: [`arn:${this.partition}:cognito-idp:${this.region}:${this.account}:userpool/*`],
+        }),
+      );
+      this.userPool.addTrigger(cognito.UserPoolOperation.PRE_SIGN_UP, preSignUpLambda);
+
+      // Async provisioning reconciler — consumes ProvisionRetry events.
+      const reconcilerLambda = new lambda.Function(this, "ProvisionReconcilerFunction", {
+        runtime: lambda.Runtime.NODEJS_24_X,
+        handler: "provision-reconciler.handler",
+        code: lambda.Code.fromAsset("dist/lambda"),
+        functionName: `citadel-provision-reconciler-${props.environment}`,
+        timeout: cdk.Duration.seconds(30),
+        environment: {
+          USERS_TABLE: usersTable.table.tableName,
+          EVENT_BUS_NAME: this.agentEventBus.eventBusName,
+        },
+        logGroup: new logs.LogGroup(this, "ProvisionReconcilerFunctionLogs", {
+          retention: logs.RetentionDays.ONE_WEEK,
+          removalPolicy: cdk.RemovalPolicy.DESTROY,
+        }),
+      });
+      usersTable.table.grantReadWriteData(reconcilerLambda);
+      this.agentEventBus.grantPutEventsTo(reconcilerLambda);
+
+      // Dead-letter queue for reconciler invocations that still fail after retries.
+      const reconcilerDlq = new sqs.Queue(this, "ProvisionReconcilerDlq", {
+        queueName: `citadel-provision-reconciler-dlq-${props.environment}`,
+        enforceSSL: true,
+        retentionPeriod: cdk.Duration.days(14),
+      });
+      new events.Rule(this, "ProvisionRetryRule", {
+        eventBus: this.agentEventBus,
+        eventPattern: { source: ["citadel.identity"], detailType: ["ProvisionRetry"] },
+        targets: [
+          new targets.LambdaFunction(reconcilerLambda, {
+            deadLetterQueue: reconcilerDlq,
+            retryAttempts: 2,
+          }),
+        ],
+      });
+
+      // Standard observability (7.1): alarms on the identity triggers/handlers.
+      const identityAlarms: Array<{ id: string; metric: cloudwatch.Metric; threshold: number; label: string }> = [
+        { id: "PreTokenErrorsAlarm", metric: preTokenGenerationLambda.metricErrors(), threshold: 1, label: "pre-token errors" },
+        { id: "PreTokenDurationAlarm", metric: preTokenGenerationLambda.metricDuration({ statistic: "p99" }), threshold: 4000, label: "pre-token p99 latency ms (Cognito 5s limit)" },
+        { id: "PreSignUpErrorsAlarm", metric: preSignUpLambda.metricErrors(), threshold: 1, label: "pre-signup errors" },
+        { id: "ProvisionReconcilerErrorsAlarm", metric: reconcilerLambda.metricErrors(), threshold: 1, label: "reconciler errors" },
+      ];
+      for (const a of identityAlarms) {
+        new cloudwatch.Alarm(this, a.id, {
+          metric: a.metric,
+          threshold: a.threshold,
+          evaluationPeriods: 1,
+          comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+          treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+          alarmDescription: `Citadel identity: ${a.label} (${props.environment})`,
+        });
+      }
+
+      // Alarm when the reconciler DLQ is non-empty (provisioning permanently failing).
+      new cloudwatch.Alarm(this, "ProvisionReconcilerDlqAlarm", {
+        metric: reconcilerDlq.metricApproximateNumberOfMessagesVisible(),
+        threshold: 1,
+        evaluationPeriods: 1,
+        comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+        treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+        alarmDescription: `Citadel identity: provisioning reconciler DLQ not empty (${props.environment})`,
+      });
+    }
 
     // Lambda functions for resolvers
     const projectResolverFunction = new lambda.Function(
@@ -2639,6 +2793,23 @@ export class BackendStack extends cdk.Stack {
       "IntegrationLambdaDataSource",
       integrationResolverFunction
     );
+
+    // ---- cognito-sso-team-management Unit B: team & operational-unit management ----
+    // Opt-in under the same oidcConfig gate as the Unit A identity wiring. Housed in
+    // a NestedStack (TeamManagementStack) because the monolithic BackendStack is near
+    // CloudFormation's 500-resource ceiling once SSO is enabled — the nested stack
+    // counts as one resource here and carries its own budget. It references the parent
+    // API, user pool, and event bus; the Foundation audit table is passed by name and
+    // granted by ARN. Least-privilege throughout; no deploy in this unit (synth + nag).
+    if (props.oidcConfig) {
+      this.teamManagement = new TeamManagementStack(this, "TeamManagement", {
+        environment: props.environment,
+        api: this.appSyncApi,
+        userPool: this.userPool,
+        eventBus: this.agentEventBus,
+        auditTableName: `citadel-identity-audit-${props.environment}`,
+      });
+    }
 
     // Query resolvers
     projectLambdaDataSource.createResolver("GetProjectResolver", {
