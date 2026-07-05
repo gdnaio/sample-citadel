@@ -1,5 +1,5 @@
 import * as cdk from "aws-cdk-lib";
-import * as appsync from "aws-cdk-lib/aws-appsync";
+import * as appsync from "@aws-cdk/aws-appsync-alpha";
 import * as cognito from "aws-cdk-lib/aws-cognito";
 import * as dynamodb from "aws-cdk-lib/aws-dynamodb";
 import * as events from "aws-cdk-lib/aws-events";
