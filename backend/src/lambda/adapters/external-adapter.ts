@@ -48,13 +48,13 @@ export class ExternalDatabaseAdapter implements ConnectorAdapter {
 
   async testConnection(
     config: Record<string, any>,
-    _credentials?: Record<string, any>
+    credentials?: Record<string, any>
   ): Promise<ConnectionTestResult> {
     switch (this.kind) {
       case 'mongodb':
         return this.testMongoConnection(config);
       case 'api':
-        return this.testApiConnection(config);
+        return this.testApiConnection(config, credentials);
       case 'postgresql':
       case 'mysql':
       case 'elasticsearch':
@@ -99,22 +99,87 @@ export class ExternalDatabaseAdapter implements ConnectorAdapter {
     }
   }
 
+  /**
+   * External REST API connectivity.
+   *
+   * Backward-compatible: with no `healthPath` configured, this validates that
+   * `baseUrl` is well-formed (the original behavior). When a `healthPath` (or
+   * `testEndpoint`) is configured, it performs a real authenticated GET and
+   * treats a non-2xx response or network error as a failed connection — so an
+   * integration is verified end-to-end, not just syntactically.
+   *
+   * Auth (from `credentials`, method hinted by `config.authMethod`):
+   *   - bearer token  -> `Authorization: Bearer <token>`   (token|bearerToken|apiToken)
+   *   - api key       -> `<config.apiKeyHeader|X-Api-Key>: <apiKey>`
+   *   - basic         -> `Authorization: Basic base64(username:password)`
+   */
   private async testApiConnection(
-    config: Record<string, any>
+    config: Record<string, any>,
+    credentials?: Record<string, any>
   ): Promise<ConnectionTestResult> {
+    let baseUrl: URL;
     try {
-      new URL(config.baseUrl);
+      baseUrl = new URL(config.baseUrl);
+    } catch {
+      return { success: false, message: `Invalid API URL: ${config.baseUrl}` };
+    }
+
+    const healthPath: string | undefined = config.healthPath ?? config.testEndpoint;
+    if (!healthPath) {
       return {
         success: true,
         message: `API URL is well-formed: ${config.baseUrl}`,
         details: { baseUrl: config.baseUrl },
       };
-    } catch {
+    }
+
+    const target = new URL(healthPath, baseUrl).toString();
+    const timeoutMs = typeof config.timeoutMs === 'number' ? config.timeoutMs : 5000;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const res = await fetch(target, {
+        method: 'GET',
+        headers: this.buildAuthHeaders(config, credentials),
+        signal: controller.signal,
+      });
+      if (res.ok) {
+        return {
+          success: true,
+          message: `API reachable: ${target} (${res.status})`,
+          details: { baseUrl: config.baseUrl, status: res.status },
+        };
+      }
       return {
         success: false,
-        message: `Invalid API URL: ${config.baseUrl}`,
+        message: `API returned ${res.status} ${res.statusText} for ${target}`,
+        details: { status: res.status },
       };
+    } catch (err: any) {
+      const reason = err?.name === 'AbortError' ? `timeout after ${timeoutMs}ms` : err?.message ?? 'unknown error';
+      return { success: false, message: `Failed to reach API at ${target}: ${reason}` };
+    } finally {
+      clearTimeout(timer);
     }
+  }
+
+  private buildAuthHeaders(
+    config: Record<string, any>,
+    credentials?: Record<string, any>
+  ): Record<string, string> {
+    const headers: Record<string, string> = { Accept: 'application/json' };
+    const method = String(config.authMethod ?? '').toUpperCase();
+    const token = credentials?.token ?? credentials?.bearerToken ?? credentials?.apiToken;
+    const apiKey = credentials?.apiKey;
+    if (apiKey && method === 'API_KEY') {
+      headers[config.apiKeyHeader ?? 'X-Api-Key'] = apiKey;
+    } else if (token) {
+      headers['Authorization'] = `Bearer ${token}`;
+    } else if (credentials?.username && credentials?.password) {
+      const basic = Buffer.from(`${credentials.username}:${credentials.password}`).toString('base64');
+      headers['Authorization'] = `Basic ${basic}`;
+    }
+    return headers;
   }
 
   private async testTcpConnection(
