@@ -150,11 +150,14 @@ describe('organization-resolver', () => {
       dynamoMock.on(ScanCommand).resolves({
         Items: [{ orgId: 'org-1', name: 'Org' }],
       });
-      // Users exist but NONE carry custom:organization === 'org-1'.
+      // Cognito returns a user, but one assigned to a DIFFERENT org — it must
+      // be ignored by the client-side custom:organization match.
       cognitoMock.on(ListUsersCommand).resolves({
         Users: [
-          { Username: 'other-1', Attributes: [{ Name: 'custom:organization', Value: 'different-org' }] },
-          { Username: 'no-attr', Attributes: [] },
+          {
+            Username: 'other-org-user',
+            Attributes: [{ Name: 'custom:organization', Value: 'org-OTHER' }],
+          },
         ],
       });
       dynamoMock.on(DeleteCommand).resolves({});
@@ -245,7 +248,7 @@ describe('organization-resolver', () => {
       ).rejects.toThrow('not found');
 
       // Cognito must NOT be consulted — existence check short-circuits first.
-      // Pins the ordering invariant: existence-check → user-count check → delete.
+      // Pins the ordering invariant: existence-check → user-scan → delete.
       expect(cognitoMock.commandCalls(ListUsersCommand)).toHaveLength(0);
       expect(dynamoMock.commandCalls(DeleteCommand)).toHaveLength(0);
     });

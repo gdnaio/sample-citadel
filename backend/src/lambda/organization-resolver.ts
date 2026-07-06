@@ -3,6 +3,7 @@ import { DynamoDBDocumentClient, PutCommand, DeleteCommand, ScanCommand } from '
 import {
   CognitoIdentityProviderClient,
   ListUsersCommand,
+  ListUsersCommandOutput,
 } from '@aws-sdk/client-cognito-identity-provider';
 import { v4 as uuidv4 } from 'uuid';
 

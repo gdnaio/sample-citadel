@@ -118,12 +118,16 @@ clean_aws() {
     fi
   fi
 
-  # Stacks in reverse dependency order
+  # Stacks in reverse dependency order.
+  # governance imports BackendStack exports (ADR/spec/interrogation tables,
+  # GraphQL API, event bus, access-logs bucket), so it MUST be deleted before
+  # citadel-backend or the backend delete fails on the in-use exports.
   local stacks=(
     "citadel-frontend-${ENVIRONMENT}"
     "citadel-gateway-${ENVIRONMENT}"
     "citadel-arbiter-${ENVIRONMENT}"
     "citadel-services-${ENVIRONMENT}"
+    "citadel-governance-${ENVIRONMENT}"
     "citadel-backend-${ENVIRONMENT}"
   )
 
