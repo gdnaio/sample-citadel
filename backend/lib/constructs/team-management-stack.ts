@@ -1,5 +1,12 @@
 import * as cdk from "aws-cdk-lib";
-import * as appsync from "aws-cdk-lib/aws-appsync";
+// Use the alpha AppSync L2 module to stay consistent with the rest of the
+// backend (backend-stack.ts, governance-stack.ts, arbiter-stack.ts). The parent
+// BackendStack constructs `appSyncApi` as an `@aws-cdk/aws-appsync-alpha`
+// `GraphqlApi` and passes it into `props.api`; importing the stable
+// `aws-cdk-lib/aws-appsync` here yields a different, incompatible `IGraphqlApi`
+// type (TS2739 — missing graphQLEndpointArn/visibility/addEventBridgeDataSource/
+// addRdsDataSourceV2/graphQlApiRef).
+import * as appsync from "@aws-cdk/aws-appsync-alpha";
 import * as cognito from "aws-cdk-lib/aws-cognito";
 import * as dynamodb from "aws-cdk-lib/aws-dynamodb";
 import * as events from "aws-cdk-lib/aws-events";
