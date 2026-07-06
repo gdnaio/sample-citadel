@@ -108,3 +108,5 @@ packaged-template.yaml
 
 # PDF generator local test folder
 service/hld_pdf_generator/test/
+
+.aidlc

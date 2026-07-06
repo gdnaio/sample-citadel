@@ -6,6 +6,7 @@ import { Banner } from './ui/banner';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from './ui/card';
 import { Alert, AlertTitle, AlertDescription } from './ui/alert';
 import { serverService } from '../services';
+import { loginWithSSO } from '../services/sso';
 import { validatePassword } from '../utils/validatePassword';
 
 interface AuthScreenProps {
@@ -348,6 +349,20 @@ export function AuthScreen({ onLogin }: AuthScreenProps) {
                         : mode === 'resetcode'
                           ? 'Reset Password'
                           : 'Set New Password'}
+                </Button>
+              )}
+
+              {mode === 'signin' && (
+                <Button
+                  type="button"
+                  variant="outline"
+                  className="w-full"
+                  onClick={() => {
+                    void loginWithSSO();
+                  }}
+                  disabled={loading}
+                >
+                  Continue with SSO
                 </Button>
               )}
 

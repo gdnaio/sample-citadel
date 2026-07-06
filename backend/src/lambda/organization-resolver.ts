@@ -8,7 +8,12 @@ import {
 import { v4 as uuidv4 } from 'uuid';
 
 const client = new DynamoDBClient({});
-const docClient = DynamoDBDocumentClient.from(client);
+// removeUndefinedValues: defensive guard so no undefined attribute can break
+// PutCommand marshalling (Issue #14). The `input.description || ''` default in
+// createOrganization handles the known case; this covers any future field.
+const docClient = DynamoDBDocumentClient.from(client, {
+  marshallOptions: { removeUndefinedValues: true },
+});
 const cognitoClient = new CognitoIdentityProviderClient({});
 
 const ORGANIZATIONS_TABLE = process.env.ORGANIZATIONS_TABLE || '';
@@ -34,6 +39,10 @@ interface UserManagementResponse {
 export const handler = async (event: any): Promise<any> => {
   console.log('Organization resolver event:', JSON.stringify(event, null, 2));
 
+  // AppSync delivers the operation name under event.info.fieldName (not
+  // event.fieldName). Reading the wrong path left fieldName undefined, so every
+  // dispatch fell through to the default case → 'Unknown field: undefined'
+  // (Issue #14). Match project-resolver.ts + docs/RESOLVER_GUIDE.md.
   const { info, arguments: args } = event;
   const fieldName = info.fieldName;
 
@@ -79,12 +88,8 @@ async function createOrganization(input: CreateOrganizationInput): Promise<Organ
   const organization: Organization = {
     orgId,
     name: input.name,
-    // Default to '' rather than passing through undefined. The document
-    // client is created without `removeUndefinedValues`, so a PutCommand
-    // with `description: undefined` fails marshalling ("Pass
-    // options.removeUndefinedValues=true ...") and surfaces as a
-    // Lambda:Unhandled error when an org is created with no description.
-    // Mirrors the `input.description || ''` idiom in project-resolver.
+    // Default to '' (matches project-resolver.ts). Writing `undefined` breaks
+    // DynamoDB marshalling in the real client → Lambda:Unhandled (Issue #14).
     description: input.description || '',
     createdAt: now,
   };
@@ -126,15 +131,9 @@ async function deleteOrganization(orgId: string): Promise<UserManagementResponse
   //    an org while users still point to it leaves dangling JWT claims
   //    and risks cross-tenant access if the orgId is ever reused.
   //
-  //    Cognito ListUsers CANNOT server-side filter on custom attributes —
-  //    `custom:*` attributes are not indexed, so a `Filter` on one returns
-  //    InvalidParameterException ("Input fails to satisfy the constraints").
-  //    AWS's guidance is to use a client-side filter instead, so we page
-  //    through the pool and match `custom:organization` in code, failing
-  //    closed if any user still points at this org. The pool is small
-  //    (internal platform), so a full scan is acceptable; revisit if the
-  //    user base grows materially.
-  //    Ref: https://docs.aws.amazon.com/cognito-user-identity-pools/latest/APIReference/API_ListUsers.html
+  //    Mirror the `createOrganization` "pre-check + throw" idiom used
+  //    above — enumerate users and fail closed if any still point at this
+  //    org (client-side match; see the ListUsers note below for why).
   //
   //    Defensive guard: if USER_POOL_ID is unset (e.g. transitional
   //    deploy ordering or local fixture), refuse the delete rather than
@@ -146,13 +145,18 @@ async function deleteOrganization(orgId: string): Promise<UserManagementResponse
     );
   }
 
-  let hasAssignedUser = false;
-  let paginationToken: string | undefined = undefined;
+  //    Cognito ListUsers server-side `Filter` supports STANDARD attributes
+  //    ONLY (username, email, phone_number, name, given_name, family_name,
+  //    preferred_username, sub, cognito:user_status, status). Filtering on a
+  //    CUSTOM attribute (custom:organization) raises InvalidParameterException
+  //    — surfaced to the client as "Input fails to satisfy the constraints"
+  //    and logged as Lambda:Unhandled (Issue #14, 2nd bug). We therefore PAGE
+  //    through the pool (max 60 users per page) and match custom:organization
+  //    CLIENT-SIDE, failing closed on the FIRST match. Bounded by design: we
+  //    check-and-early-exit per page and never buffer an unbounded user array.
+  let paginationToken: string | undefined;
   do {
-    // No `AttributesToGet` filter: Cognito errors if a requested attribute
-    // is unset on any returned user, so we fetch full profiles and read
-    // `custom:organization` locally. Limit 60 is the ListUsers maximum.
-    const usersResponse: ListUsersCommandOutput = await cognitoClient.send(
+    const usersResponse = await cognitoClient.send(
       new ListUsersCommand({
         UserPoolId: USER_POOL_ID,
         Limit: 60,
@@ -160,20 +164,19 @@ async function deleteOrganization(orgId: string): Promise<UserManagementResponse
       })
     );
 
-    hasAssignedUser = (usersResponse.Users ?? []).some((user) =>
-      (user.Attributes ?? []).some(
+    for (const user of usersResponse.Users ?? []) {
+      const assignedToOrg = (user.Attributes ?? []).some(
         (attr) => attr.Name === 'custom:organization' && attr.Value === orgId
-      )
-    );
+      );
+      if (assignedToOrg) {
+        throw new Error(
+          'Cannot delete organization: 1+ user(s) still assigned. Reassign or remove these users before deleting the organization.'
+        );
+      }
+    }
 
     paginationToken = usersResponse.PaginationToken;
-  } while (!hasAssignedUser && paginationToken);
-
-  if (hasAssignedUser) {
-    throw new Error(
-      'Cannot delete organization: 1+ user(s) still assigned. Reassign or remove these users before deleting the organization.'
-    );
-  }
+  } while (paginationToken);
 
   // 3. Safe to delete.
   //

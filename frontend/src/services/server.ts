@@ -18,6 +18,7 @@ import {
   confirmResetPassword,
 } from "aws-amplify/auth";
 import type { ResetPasswordOutput } from "aws-amplify/auth";
+import { buildOAuthConfig } from "./sso";
 
 interface AmplifyConfig {
   region: string;
@@ -33,6 +34,12 @@ interface AmplifyConfig {
   appsyncApiKey?: string;
   environment?: string;
   eventBusUrl?: string;
+  // SSO / Hosted UI (cognito-sso-team-management). When the domain + redirects are
+  // present, OIDC federation is enabled; otherwise auth behaves exactly as before.
+  ssoHostedUiDomain?: string;
+  ssoRedirectSignIn?: string;
+  ssoRedirectSignOut?: string;
+  ssoProviderName?: string;
 }
 
 interface SignUpParams {
@@ -85,6 +92,17 @@ class ServerService {
 
     if (config.identityPoolId) {
       cognitoConfig.identityPoolId = config.identityPoolId;
+    }
+
+    // SSO: enable Hosted UI OAuth only when configured (opt-in). Leaves the default
+    // email/password login untouched when SSO is not configured.
+    if (config.ssoHostedUiDomain && config.ssoRedirectSignIn && config.ssoRedirectSignOut) {
+      cognitoConfig.loginWith.oauth = buildOAuthConfig({
+        hostedUiDomain: config.ssoHostedUiDomain,
+        redirectSignIn: config.ssoRedirectSignIn,
+        redirectSignOut: config.ssoRedirectSignOut,
+        providerName: config.ssoProviderName,
+      });
     }
 
     const graphqlConfig: any = {
